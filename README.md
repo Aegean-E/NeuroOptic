@@ -1,6 +1,10 @@
 # NeuroOptic
 
-## Generalized Visual Entrainment Engine (Gamma-Optimized)
+<p align="center">
+  <img src="https://github.com/Aegean-E/NeuroOptic/blob/main/banner.png?raw=true" alt="NeuroOptic Banner" width="1200">
+</p>
+
+## Generalized Visual Entrainment Engine
 
 NeuroOptic is a research-grade visual oscillator designed for precise brainwave entrainment. It supports configurable frequencies (1–120 Hz) with hardware-aware safety limits and drift-free phase accumulation.
 

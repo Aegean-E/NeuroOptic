@@ -9,6 +9,7 @@ and strict safety limits based on monitor refresh rates.
 import sys
 import time
 import math
+import platform
 import random
 import csv
 import os
@@ -52,6 +53,7 @@ class StimulationMode(Enum):
     PERIPHERAL_RING = auto()
     HEMIFIELD_LEFT = auto()
     HEMIFIELD_RIGHT = auto()
+    SPLIT_HEMIFIELD = auto() # Left/Right independent
     QUADRANT_TL = auto()  # Top-Left
     QUADRANT_TR = auto()  # Top-Right
     QUADRANT_BL = auto()  # Bottom-Left
@@ -134,7 +136,7 @@ class Oscillator:
     Core equation: phase(t) = (2π × f × t + φ) mod 2π
     """
 
-    def __init__(self, frequency: float, waveform: WaveformType, phase_offset: float = 0.0):
+    def __init__(self, frequency: float, waveform: WaveformType, phase_offset: float = 0.0, rng: random.Random = None):
         self.frequency = frequency
         self.waveform = waveform
         self.phase_base = phase_offset  # Base phase offset (radians)
@@ -142,6 +144,7 @@ class Oscillator:
         self.carrier_freq = 0.0  # Only for AM_CARRIER
         self.carrier_phase_base = 0.0
         self.phase_jitter = 0.0
+        self.rng = rng if rng else random.Random()
 
     def set_phase_jitter(self, amount: float):
         self.phase_jitter = amount
@@ -178,7 +181,7 @@ class Oscillator:
         # Core Phase Calculation
         jitter = 0.0
         if self.phase_jitter > 0:
-            jitter = random.uniform(-self.phase_jitter, self.phase_jitter)
+            jitter = self.rng.uniform(-self.phase_jitter, self.phase_jitter)
 
         # phase = 2π * f * dt + φ_base
         phase = (2 * math.pi * self.frequency * dt + self.phase_base + jitter) % (2 * math.pi)
@@ -223,31 +226,40 @@ class EntrainmentEngine:
             sham_seed: Optional[int] = None,
             gamma: float = 1.0,
             brightness: float = 1.0,
-            phase_offset: float = 0.0
+            phase_offset: float = 0.0,
+            right_freq: Optional[float] = None,
+            right_phase_offset: float = 0.0
     ):
         self.target_freq = target_freq
         self.waveform = waveform
+        self.waveform_left = waveform
+        self.waveform_right = waveform
         self.mode = mode
         self.ramp_duration = ramp_duration
         self.session_duration = session_duration
         self.gamma = gamma
         self.max_brightness = brightness
         self.phase_offset_rad = math.radians(phase_offset)
+        
+        # Dual Hemifield Logic
+        self.right_freq = right_freq if right_freq is not None else target_freq
+        self.right_phase_rad = math.radians(right_phase_offset)
+        
         self.sham_type = sham_type
 
-        # Sham Logic Setup
+        # 11️⃣ Deterministic Randomness Scope
         if sham_seed is None:
             sham_seed = random.randint(0, 100000)
         self.sham_seed = sham_seed
-        random.seed(self.sham_seed)
+        self.rng = random.Random(self.sham_seed)
 
         if self.sham_type != ShamType.NONE:
             logger.warning(f"⚠ SHAM MODE ACTIVE: {self.sham_type.name} | Seed: {self.sham_seed}")
-
             if self.sham_type == ShamType.DETUNE:
                 # Detune by +/- 5-10%
-                detune_factor = random.choice([0.90, 0.95, 1.05, 1.10])
+                detune_factor = self.rng.choice([0.90, 0.95, 1.05, 1.10])
                 self.target_freq *= detune_factor
+                self.right_freq *= detune_factor # Detune both
                 logger.info(f"Sham: Frequency detuned to {self.target_freq:.2f} Hz")
 
             elif self.sham_type == ShamType.STATIC:
@@ -256,7 +268,9 @@ class EntrainmentEngine:
 
         self.window = None
         self.monitor_refresh_rate = 60  # Default fallback
-        self.oscillator: Optional[Oscillator] = None  # Defer creation until hardware init
+        self.oscillator_left: Optional[Oscillator] = None
+        self.oscillator_right: Optional[Oscillator] = None
+        self.gpu_info = {}
         self.running = False
 
         self.phase_jitter_amount = 0.0
@@ -281,18 +295,25 @@ class EntrainmentEngine:
 
         logger.info(f"Hardware Detected: {mode.size.width}x{mode.size.height} @ {self.monitor_refresh_rate} Hz")
 
-        # Validate Frequency against Hardware
+        # Validate Frequencies against Hardware
         try:
-            self.target_freq, self.waveform = FrequencyManager.validate_frequency(self.target_freq,
+            # Validate Left (Main)
+            self.target_freq, self.waveform_left = FrequencyManager.validate_frequency(self.target_freq,
+                                                                                  self.monitor_refresh_rate,
+                                                                                  self.waveform)
+            # Validate Right
+            self.right_freq, self.waveform_right = FrequencyManager.validate_frequency(self.right_freq,
                                                                                   self.monitor_refresh_rate,
                                                                                   self.waveform)
 
             # Create Oscillator AFTER validation to ensure settings (like jitter) aren't overwritten
-            self.oscillator = Oscillator(self.target_freq, self.waveform, phase_offset=self.phase_offset_rad)
+            self.oscillator_left = Oscillator(self.target_freq, self.waveform_left, phase_offset=self.phase_offset_rad, rng=self.rng)
+            self.oscillator_right = Oscillator(self.right_freq, self.waveform_right, phase_offset=self.right_phase_rad, rng=self.rng)
 
             # Apply Sham / Advanced Settings
             if self.phase_jitter_amount > 0:
-                self.oscillator.set_phase_jitter(self.phase_jitter_amount)
+                self.oscillator_left.set_phase_jitter(self.phase_jitter_amount)
+                self.oscillator_right.set_phase_jitter(self.phase_jitter_amount)
 
             band = FrequencyManager.get_band_name(self.target_freq)
             logger.info(f"Target Frequency: {self.target_freq} Hz ({band}) - SAFE")
@@ -304,7 +325,8 @@ class EntrainmentEngine:
         # If AM Carrier, set carrier to max safe frequency (Nyquist)
         if self.waveform == WaveformType.AM_CARRIER:
             carrier = self.monitor_refresh_rate / 2.0
-            self.oscillator.set_carrier_frequency(carrier)
+            self.oscillator_left.set_carrier_frequency(carrier)
+            self.oscillator_right.set_carrier_frequency(carrier)
             logger.info(f"AM Carrier Frequency set to: {carrier} Hz")
 
         # Create Window (Fullscreen recommended for immersion, windowed for dev)
@@ -334,6 +356,9 @@ class EntrainmentEngine:
         # We query OpenGL after context is current
         renderer = glGetString(GL_RENDERER).decode('utf-8')
         version = glGetString(GL_VERSION).decode('utf-8')
+        
+        self.gpu_info['renderer'] = renderer
+        self.gpu_info['version'] = version
 
         # Color depth
         depth = mode.bits.red + mode.bits.green + mode.bits.blue
@@ -358,22 +383,32 @@ class EntrainmentEngine:
         glEnd()
 
     def set_frequency(self, freq: float):
-        if self.oscillator:
-            self.oscillator.set_frequency(freq, glfw.get_time())  # Use monotonic time if tracking that, or elapsed
+        # Updates main (left) oscillator
+        if self.oscillator_left:
+            self.oscillator_left.set_frequency(freq, glfw.get_time())
 
     def update_phase(self, delta_deg: float):
-        if self.oscillator:
-            self.oscillator.update_phase(math.radians(delta_deg))
+        if self.oscillator_left:
+            self.oscillator_left.update_phase(math.radians(delta_deg))
 
-    def render_stimulus(self, luminance: float):
+    def render_stimulus(self, lum_left: float, lum_right: float):
         """Renders the visual stimulus based on the selected mode."""
-        # Set the oscillating color
-        glColor3f(luminance, luminance, luminance)
-
+        
         if self.mode == StimulationMode.FULL_SCREEN:
+            glColor3f(lum_left, lum_left, lum_left)
             glRectf(-1.0, -1.0, 1.0, 1.0)
 
+        elif self.mode == StimulationMode.SPLIT_HEMIFIELD:
+            # 10️⃣ Independent Dual-Hemifield
+            # Left Side
+            glColor3f(lum_left, lum_left, lum_left)
+            glRectf(-1.0, -1.0, 0.0, 1.0)
+            # Right Side
+            glColor3f(lum_right, lum_right, lum_right)
+            glRectf(0.0, -1.0, 1.0, 1.0)
+
         elif self.mode == StimulationMode.PERIPHERAL_RING:
+            glColor3f(lum_left, lum_left, lum_left)
             # 1. Draw full oscillating background
             glRectf(-1.0, -1.0, 1.0, 1.0)
             # 2. Draw static black central mask (Radius 0.3 NDC)
@@ -381,21 +416,29 @@ class EntrainmentEngine:
             self._draw_circle(0.3)
 
         elif self.mode == StimulationMode.HEMIFIELD_LEFT:
+            glColor3f(lum_left, lum_left, lum_left)
             glRectf(-1.0, -1.0, 0.0, 1.0)  # Left half
 
         elif self.mode == StimulationMode.HEMIFIELD_RIGHT:
+            # Use lum_left (main) unless we want to force right oscillator? 
+            # Standard behavior is main freq on selected field.
+            glColor3f(lum_left, lum_left, lum_left)
             glRectf(0.0, -1.0, 1.0, 1.0)  # Right half
 
         elif self.mode == StimulationMode.QUADRANT_TL:
+            glColor3f(lum_left, lum_left, lum_left)
             glRectf(-1.0, 0.0, 0.0, 1.0)  # Top-Left
 
         elif self.mode == StimulationMode.QUADRANT_TR:
+            glColor3f(lum_left, lum_left, lum_left)
             glRectf(0.0, 0.0, 1.0, 1.0)  # Top-Right
 
         elif self.mode == StimulationMode.QUADRANT_BL:
+            glColor3f(lum_left, lum_left, lum_left)
             glRectf(-1.0, -1.0, 0.0, 0.0)  # Bottom-Left
 
         elif self.mode == StimulationMode.QUADRANT_BR:
+            glColor3f(lum_left, lum_left, lum_left)
             glRectf(0.0, -1.0, 1.0, 0.0)  # Bottom-Right
 
     def run(self):
@@ -449,29 +492,35 @@ class EntrainmentEngine:
             # 4. Oscillator Update & Luminance Calculation
             # We pass the SESSION time (elapsed_time) to the oscillator.
             # This ensures Phase 0 always aligns with Session Start (t=0), regardless of startup delay.
-            raw_luminance = self.oscillator.get_luminance(elapsed_time)
+            raw_lum_left = self.oscillator_left.get_luminance(elapsed_time)
+            raw_lum_right = self.oscillator_right.get_luminance(elapsed_time)
 
             # Apply amplitude envelope (Ramp/Sham)
-            luminance = raw_luminance * amplitude_scalar
+            lum_left = raw_lum_left * amplitude_scalar
+            lum_right = raw_lum_right * amplitude_scalar
 
             # 6️⃣ Brightness Ceiling (Scaling)
-            luminance *= self.max_brightness
+            lum_left *= self.max_brightness
+            lum_right *= self.max_brightness
 
             # 5️⃣ Gamma Correction (Inverse)
             # L_out = L_in ^ gamma  =>  L_in = L_out ^ (1/gamma)
-            if self.gamma != 1.0 and luminance > 0:
-                luminance = luminance ** (1.0 / self.gamma)
+            if self.gamma != 1.0:
+                if lum_left > 0: lum_left = lum_left ** (1.0 / self.gamma)
+                if lum_right > 0: lum_right = lum_right ** (1.0 / self.gamma)
 
             # Record Metric (Skip first frame initialization delta)
             # OPTIMIZATION: Append once with calculated luminance to avoid double tuple allocation
+            # We log Left luminance as primary reference
             if frame_count > 0:
-                self.frame_data.append((current_time, delta_time, luminance))
+                self.frame_data.append((current_time, delta_time, lum_left))
 
             # 4. Render
             # Clear background to black
             glClearColor(0.0, 0.0, 0.0, 1.0)
             glClear(GL_COLOR_BUFFER_BIT)
-            self.render_stimulus(luminance)
+            
+            self.render_stimulus(lum_left, lum_right)
 
             # 5. VSync Swap
             glfw.swap_buffers(self.window)
@@ -567,6 +616,31 @@ class EntrainmentEngine:
         try:
             with open(filename, 'w', newline='') as csvfile:
                 writer = csv.writer(csvfile)
+                
+                # 12️⃣ Log More Metadata (Header Block)
+                writer.writerow(["# === Session Metadata ==="])
+                writer.writerow(["# OS", f"{platform.system()} {platform.release()}"])
+                writer.writerow(["# Python", sys.version.split()[0]])
+                writer.writerow(["# GPU", self.gpu_info.get('renderer', 'Unknown')])
+                writer.writerow(["# Driver", self.gpu_info.get('version', 'Unknown')])
+                writer.writerow(["# Refresh Rate", f"{self.monitor_refresh_rate} Hz"])
+                writer.writerow(["# VSync", "Enabled"])
+                writer.writerow(["# Mode", self.mode.name])
+                writer.writerow(["# Waveform (Left)", self.waveform_left.name])
+                writer.writerow(["# Frequency (Left)", f"{self.target_freq} Hz"])
+                writer.writerow(["# Phase (Left)", f"{math.degrees(self.phase_offset_rad):.1f} deg"])
+                if self.mode == StimulationMode.SPLIT_HEMIFIELD:
+                    writer.writerow(["# Waveform (Right)", self.waveform_right.name])
+                    writer.writerow(["# Frequency (Right)", f"{self.right_freq} Hz"])
+                    writer.writerow(["# Phase (Right)", f"{math.degrees(self.right_phase_rad):.1f} deg"])
+                writer.writerow(["# Ramp Duration", f"{self.ramp_duration} s"])
+                writer.writerow(["# Session Duration", f"{self.session_duration} s"])
+                writer.writerow(["# Gamma", self.gamma])
+                writer.writerow(["# Brightness Cap", self.max_brightness])
+                writer.writerow(["# Sham Type", self.sham_type.name])
+                writer.writerow(["# Sham Seed", self.sham_seed])
+                writer.writerow(["# ========================"])
+                
                 # Header
                 writer.writerow(["Frame_ID", "Timestamp_Monotonic", "Delta_Time_Sec", "Luminance_NDC", "Target_Freq_Hz",
                                  "Sham_Mode"])
@@ -607,7 +681,7 @@ def parse_arguments():
     parser.add_argument(
         '--mode',
         type=str,
-        choices=['full', 'ring', 'left', 'right', 'quad_tl', 'quad_tr', 'quad_bl', 'quad_br'],
+        choices=['full', 'ring', 'left', 'right', 'split', 'quad_tl', 'quad_tr', 'quad_bl', 'quad_br'],
         default='full',
         help='Stimulation mode: full (default), ring (peripheral), left (hemifield), right (hemifield)'
     )
@@ -662,6 +736,19 @@ def parse_arguments():
         help='Initial phase offset in degrees (0-360).'
     )
 
+    parser.add_argument(
+        '--freq-right',
+        type=float,
+        help='Target frequency for Right Hemifield (Split mode only). Defaults to --freq if unset.'
+    )
+
+    parser.add_argument(
+        '--phase-right',
+        type=float,
+        default=0.0,
+        help='Phase offset for Right Hemifield in degrees (0-360).'
+    )
+
     return parser.parse_args()
 
 
@@ -681,6 +768,7 @@ if __name__ == "__main__":
         'ring': StimulationMode.PERIPHERAL_RING,
         'left': StimulationMode.HEMIFIELD_LEFT,
         'right': StimulationMode.HEMIFIELD_RIGHT,
+        'split': StimulationMode.SPLIT_HEMIFIELD,
         'quad_tl': StimulationMode.QUADRANT_TL,
         'quad_tr': StimulationMode.QUADRANT_TR,
         'quad_bl': StimulationMode.QUADRANT_BL,
@@ -720,7 +808,9 @@ if __name__ == "__main__":
         sham_type=sham_map[args.sham],
         gamma=args.gamma,
         brightness=args.brightness,
-        phase_offset=args.phase
+        phase_offset=args.phase,
+        right_freq=args.freq_right,
+        right_phase_offset=args.phase_right
     )
 
     engine.initialize_hardware()

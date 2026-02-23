@@ -57,7 +57,7 @@ class NeuroOpticLauncher:
         self.mode_combo = ttk.Combobox(vis_frame, textvariable=self.mode_var, state="readonly")
         self.mode_combo['values'] = (
             'full', 'ring',
-            'left', 'right',
+            'left', 'right', 'split',
             'quad_tl', 'quad_tr', 'quad_bl', 'quad_br'
         )
         self.mode_combo.grid(row=0, column=1, sticky=tk.E, padx=5)
@@ -100,6 +100,14 @@ class NeuroOpticLauncher:
         self.phase_var = tk.DoubleVar(value=0.0)
         ttk.Entry(display_frame, textvariable=self.phase_var, width=10).grid(row=1, column=1, sticky=tk.E, padx=5)
 
+        ttk.Label(display_frame, text="Right Freq (Split):").grid(row=1, column=2, sticky=tk.W, pady=5, padx=(10, 0))
+        self.right_freq_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(display_frame, textvariable=self.right_freq_var, width=10).grid(row=1, column=3, sticky=tk.E, padx=5)
+
+        ttk.Label(display_frame, text="Right Phase (°):").grid(row=2, column=2, sticky=tk.W, pady=5, padx=(10, 0))
+        self.right_phase_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(display_frame, textvariable=self.right_phase_var, width=10).grid(row=2, column=3, sticky=tk.E, padx=5)
+
         # --- Launch Button ---
         self.launch_btn = ttk.Button(main_frame, text="LAUNCH ENGINE", command=self.launch_engine)
         self.launch_btn.pack(fill=tk.X, pady=20, ipady=10)
@@ -138,8 +146,13 @@ class NeuroOpticLauncher:
             '--sham', self.sham_var.get(),
             '--gamma', str(self.gamma_var.get()),
             '--brightness', str(self.brightness_var.get()),
-            '--phase', str(self.phase_var.get())
+            '--phase', str(self.phase_var.get()),
+            '--phase-right', str(self.right_phase_var.get())
         ]
+
+        # Only pass right freq if it's set (non-zero), otherwise engine defaults to main freq
+        if self.right_freq_var.get() > 0:
+            cmd.extend(['--freq-right', str(self.right_freq_var.get())])
 
         try:
             # Launch as a separate subprocess
