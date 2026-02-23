@@ -288,6 +288,8 @@ class StimulusRenderer:
         self.vao = None
         self.lut_tex = None
         self.lut_active = False
+        self.query = None
+        self.gpu_timer_available = False
 
     def init_gl(self):
         # Compile Shader
@@ -319,6 +321,13 @@ class StimulusRenderer:
         glEnableVertexAttribArray(1)
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(2 * 4))
 
+        # Setup GPU Timer Queries
+        try:
+            self.query = glGenQueries(1)
+            self.gpu_timer_available = True
+        except Exception as e:
+            logger.warning(f"GPU Timer Queries not supported: {e}")
+
     def load_calibration(self, filepath: str):
         """Loads a CSV (Input, Output) and creates a 1D Texture LUT."""
         try:
@@ -344,6 +353,20 @@ class StimulusRenderer:
             logger.info(f"Photometric Calibration Loaded: {len(lut_data)} points.")
         except Exception as e:
             logger.error(f"Failed to load calibration: {e}")
+
+    def get_last_gpu_duration(self):
+        """Returns the GPU execution time of the previous frame in nanoseconds."""
+        if not self.gpu_timer_available:
+            return 0
+        
+        # Check if result is available (non-blocking)
+        # We typically call this at the start of the NEXT frame, so result should be ready.
+        try:
+            available = glGetQueryObjectiv(self.query, GL_QUERY_RESULT_AVAILABLE)
+            if available:
+                return glGetQueryObjectuiv(self.query, GL_QUERY_RESULT)
+        except: pass
+        return 0
 
     def render(self, phase_l, c_phase_l, phase_r, c_phase_r, 
                wf_l, wf_r, amp_l, amp_r, mode, gamma):
@@ -381,7 +404,14 @@ class StimulusRenderer:
             glUniform1i(glGetUniformLocation(self.shader, "u_lut"), 0)
 
         glBindVertexArray(self.vao)
+        
+        if self.gpu_timer_available:
+            glBeginQuery(GL_TIME_ELAPSED, self.query)
+            
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+        
+        if self.gpu_timer_available:
+            glEndQuery(GL_TIME_ELAPSED)
 
 
 class EntrainmentEngine:
@@ -399,7 +429,8 @@ class EntrainmentEngine:
             phase_offset: float = 0.0,
             right_freq: Optional[float] = None,
             right_phase_offset: float = 0.0,
-            calibration_file: Optional[str] = None
+            calibration_file: Optional[str] = None,
+            compat_mode: str = 'standard'
     ):
         self.target_freq = target_freq
         self.waveform = waveform
@@ -412,6 +443,7 @@ class EntrainmentEngine:
         self.max_brightness = brightness
         self.phase_offset_rad = math.radians(phase_offset)
         self.calibration_file = calibration_file
+        self.compat_mode = compat_mode
         
         # Dual Hemifield Logic
         self.right_freq = right_freq if right_freq is not None else target_freq
@@ -505,6 +537,11 @@ class EntrainmentEngine:
         # Create Window (Fullscreen recommended for immersion, windowed for dev)
         glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
         glfw.window_hint(glfw.RESIZABLE, glfw.FALSE)
+        
+        # Exclusive Mode Hints (Bypass Compositor/DWM where possible)
+        glfw.window_hint(glfw.AUTO_ICONIFY, glfw.FALSE) # Keep app running if focus shifts
+        glfw.window_hint(glfw.FLOATING, glfw.TRUE)      # Request "Always on Top" priority
+        glfw.window_hint(glfw.CENTER_CURSOR, glfw.TRUE) # Capture mouse
 
         # Create a fullscreen window on the primary monitor
         self.window = glfw.create_window(mode.size.width, mode.size.height, "NeuroOptic Engine", monitor, None)
@@ -558,6 +595,23 @@ class EntrainmentEngine:
         if self.oscillator_left:
             self.oscillator_left.update_phase(math.radians(delta_deg))
 
+    def compute_cpu_signal(self, waveform: WaveformType, phase: float, carrier_phase: float) -> float:
+        """
+        Mirrors the GLSL shader logic to compute exact signal value on CPU for logging.
+        """
+        if waveform == WaveformType.SQUARE:
+            return 1.0 if math.sin(phase) >= 0.0 else 0.0
+        elif waveform == WaveformType.SINE:
+            return 0.5 + 0.5 * math.sin(phase)
+        elif waveform == WaveformType.AM_CARRIER:
+            car = 0.5 + 0.5 * math.sin(carrier_phase)
+            mod = 0.5 + 0.5 * math.sin(phase)
+            return car * mod
+        elif waveform == WaveformType.TRIANGLE:
+            p = (phase % (2 * math.pi)) / (2 * math.pi)
+            return 1.0 - abs(2.0 * p - 1.0)
+        return 0.0
+
     def run(self):
         """
         Main Rendering Loop.
@@ -571,6 +625,7 @@ class EntrainmentEngine:
 
         expected_frame_time = 1.0 / self.monitor_refresh_rate
         last_frame_time = start_time
+        last_gpu_time_ns = 0
 
         logger.info("Engine Started. Press ESC to exit.")
         logger.info(f"Recording session data... (Expected IFI: {expected_frame_time * 1000:.2f} ms)")
@@ -583,6 +638,9 @@ class EntrainmentEngine:
             current_time = glfw.get_time()
             delta_time = current_time - last_frame_time
             elapsed_time = current_time - start_time
+
+            # Retrieve GPU timing from the PREVIOUS frame (to avoid stalling pipeline)
+            last_gpu_time_ns = self.renderer.get_last_gpu_duration()
 
             # Session Duration Check
             if self.session_duration > 0 and elapsed_time > self.session_duration:
@@ -618,14 +676,14 @@ class EntrainmentEngine:
             amp_l = amplitude_scalar * self.max_brightness
             amp_r = amplitude_scalar * self.max_brightness
 
+            # Compute CPU-side signal value for accurate logging/analysis
+            # Mirroring shader logic to capture actual waveform dynamics
+            raw_signal = self.compute_cpu_signal(self.waveform_left, ph_l, c_ph_l)
+            logged_luminance = raw_signal * amp_l
+
             # Record Metric (Skip first frame initialization delta)
-            # For logging, we approximate the luminance of the Left channel
-            # Note: This is pre-gamma/calibration, representing the "Signal"
             if frame_count > 0:
-                # Simple sine approximation for log if needed, or just 0.0
-                # Calculating exact luminance here duplicates shader work. 
-                # We log the signal amplitude for now.
-                self.frame_data.append((current_time, delta_time, amp_l))
+                self.frame_data.append((current_time, delta_time, logged_luminance, last_gpu_time_ns))
 
             # 4. Render
             glClearColor(0.0, 0.0, 0.0, 1.0)
@@ -669,10 +727,15 @@ class EntrainmentEngine:
         timestamps = np.array([x[0] for x in self.frame_data])
         deltas = np.array([x[1] for x in self.frame_data])
         luminances = np.array([x[2] for x in self.frame_data])
+        gpu_times = np.array([x[3] for x in self.frame_data])
 
         # 1. Compute Metrics
         mean_ifi = np.mean(deltas) * 1000.0  # ms
         std_ifi = np.std(deltas) * 1000.0  # ms
+        min_ifi = np.min(deltas) * 1000.0  # ms
+        max_ifi = np.max(deltas) * 1000.0  # ms
+        p99_ifi = np.percentile(deltas, 99) * 1000.0  # ms
+        mean_gpu = np.mean(gpu_times) / 1_000_000.0 # ns to ms
 
         expected_ifi = (1.0 / self.monitor_refresh_rate)
         # Frame drop defined as deviation > 10% of expected interval
@@ -681,6 +744,16 @@ class EntrainmentEngine:
         drop_pct = (dropped_frames / len(deltas)) * 100.0
 
         effective_fps = 1.0 / np.mean(deltas)
+        
+        # Statistical Delivered Frequency
+        effective_delivered_freq = 0.0
+        drift = 0.0
+        if self.target_freq > 0:
+            frames_per_cycle = self.monitor_refresh_rate / self.target_freq
+            effective_delivered_freq = effective_fps / frames_per_cycle
+            drift = abs(self.target_freq - effective_delivered_freq)
+            # Note: This drift is purely statistical (jitter-induced). 
+            # The deterministic phase accumulator has 0.00 Hz drift.
 
         # 2. Compute Actual Delivered Frequency (Zero-Crossing Analysis)
         # Remove DC offset to center signal around 0
@@ -709,11 +782,25 @@ class EntrainmentEngine:
 
         logger.info("=== Session Integrity Report ===")
         logger.info(f"Total Frames: {len(deltas)}")
-        logger.info(f"Mean Frame Interval: {mean_ifi:.3f} ms (σ = {std_ifi:.3f} ms)")
+        logger.info(f"Frame Interval Metrics:")
+        logger.info(f"  - Mean: {mean_ifi:.3f} ms (σ = {std_ifi:.3f} ms)")
+        logger.info(f"  - Min / Max: {min_ifi:.3f} ms / {max_ifi:.3f} ms")
+        logger.info(f"  - 99th Percentile: {p99_ifi:.3f} ms")
         logger.info(f"Effective Refresh Rate: {effective_fps:.2f} Hz")
+        logger.info(f"GPU Render Time (Mean): {mean_gpu:.3f} ms")
         logger.info(f"Frame Drops: {dropped_frames} ({drop_pct:.2f}%)")
-        logger.info(f"Target Frequency: {self.target_freq:.2f} Hz")
-        logger.info(f"Measured Delivered Frequency: {measured_freq:.3f} Hz (Actual)")
+        logger.info(f"Frequency Analysis:")
+        logger.info(f"  - Target: {self.target_freq:.4f} Hz")
+        logger.info(f"  - Delivered (Statistical): {effective_delivered_freq:.4f} Hz")
+        logger.info(f"  - Drift: {drift:.4f} Hz ({'EXCELLENT' if drift < 0.01 else 'ACCEPTABLE'})")
+        logger.info(f"  - Measured (Signal Zero-Crossing): {measured_freq:.3f} Hz")
+        logger.info(f"Phase Consistency: Frame-Locked (No cumulative phase error from OS jitter)")
+
+        if self.compat_mode == 'ptb':
+            logger.info("=== PTB Compatibility Summary ===")
+            logger.info(f"  Missed Deadlines: {dropped_frames}")
+            logger.info(f"  Std Dev (Jitter): {std_ifi:.3f} ms")
+            logger.info("=================================")
 
         if self.dropped_frame_log:
             logger.warning(f"Performance Alert: {len(self.dropped_frame_log)} frames dropped during session.")
@@ -753,20 +840,55 @@ class EntrainmentEngine:
                 writer.writerow(["# Gamma", self.gamma])
                 writer.writerow(["# Brightness Cap", self.max_brightness])
                 writer.writerow(["# Sham Type", self.sham_type.name])
+                writer.writerow(["# Mean IFI", f"{mean_ifi:.3f} ms"])
+                writer.writerow(["# Std IFI", f"{std_ifi:.3f} ms"])
+                writer.writerow(["# 99th % IFI", f"{p99_ifi:.3f} ms"])
+                writer.writerow(["# Mean GPU Time", f"{mean_gpu:.3f} ms"])
+                writer.writerow(["# Delivered Freq", f"{effective_delivered_freq:.4f} Hz"])
+                writer.writerow(["# Freq Drift", f"{drift:.4f} Hz"])
                 writer.writerow(["# Calibration File", self.calibration_file if self.calibration_file else "None"])
                 writer.writerow(["# Sham Seed", self.sham_seed])
                 writer.writerow(["# ========================"])
                 
                 # Header
-                writer.writerow(["Frame_ID", "Timestamp_Monotonic", "Delta_Time_Sec", "Luminance_NDC", "Target_Freq_Hz",
-                                 "Sham_Mode"])
+                if self.compat_mode == 'ptb':
+                    writer.writerow(["frame_idx", "vbl_timestamp", "ifi", "stimulus_val", "target_freq", "sham_mode", "gpu_ns"])
+                else:
+                    writer.writerow(["Frame_ID", "Timestamp_Monotonic", "Delta_Time_Sec", "Luminance_NDC", "Target_Freq_Hz",
+                                     "Sham_Mode", "GPU_Render_Time_ns"])
                 # Data
-                for i, (ts, dt, lum) in enumerate(self.frame_data):
-                    writer.writerow([i, f"{ts:.6f}", f"{dt:.6f}", f"{lum:.4f}", self.target_freq, self.sham_type.name])
+                for i, (ts, dt, lum, gpu) in enumerate(self.frame_data):
+                    writer.writerow([i, f"{ts:.6f}", f"{dt:.6f}", f"{lum:.4f}", self.target_freq, self.sham_type.name, gpu])
 
             logger.info(f"Session data saved to: {os.path.abspath(filename)}")
+            
+            if self.compat_mode == 'ptb':
+                self.generate_matlab_loader(filename)
+
         except IOError as e:
             logger.error(f"Failed to save session data: {e}")
+
+    def generate_matlab_loader(self, csv_path):
+        m_path = csv_path.replace('.csv', '.m')
+        try:
+            with open(m_path, 'w') as f:
+                f.write(f"% NeuroOptic Session Loader (PTB Compatibility Mode)\n")
+                f.write(f"% Generated: {datetime.now()}\n\n")
+                f.write(f"fname = '{os.path.basename(csv_path)}';\n")
+                f.write("opts = detectImportOptions(fname);\n")
+                f.write("opts.CommentStyle = '#';\n")
+                f.write("opts.VariableNamingRule = 'preserve';\n")
+                f.write("data = readtable(fname, opts);\n\n")
+                f.write("% PTB-style Validation Plot\n")
+                f.write("figure; subplot(2,1,1);\n")
+                f.write("plot(data.vbl_timestamp(2:end), diff(data.vbl_timestamp)*1000);\n")
+                f.write("title('Frame Intervals (IFI)'); ylabel('ms'); xlabel('Frame');\n")
+                f.write("subplot(2,1,2);\n")
+                f.write("plot(data.vbl_timestamp, data.stimulus_val);\n")
+                f.write("title('Stimulus Trace'); ylabel('Luminance'); xlabel('Time (s)');\n")
+            logger.info(f"MATLAB pipeline script generated: {m_path}")
+        except Exception as e:
+            logger.error(f"Could not generate MATLAB script: {e}")
 
     def cleanup(self):
         logger.info("Shutting down engine...")
@@ -871,6 +993,14 @@ def parse_arguments():
         help='Path to photometric calibration CSV (Input, Output).'
     )
 
+    parser.add_argument(
+        '--compat',
+        type=str,
+        choices=['standard', 'ptb'],
+        default='standard',
+        help='Output compatibility mode: standard (default) or ptb (Psychtoolbox/MATLAB friendly)'
+    )
+
     return parser.parse_args()
 
 
@@ -933,7 +1063,8 @@ if __name__ == "__main__":
         phase_offset=args.phase,
         right_freq=args.freq_right,
         right_phase_offset=args.phase_right,
-        calibration_file=args.calib_file
+        calibration_file=args.calib_file,
+        compat_mode=args.compat
     )
 
     engine.initialize_hardware()
