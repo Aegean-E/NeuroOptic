@@ -15,7 +15,18 @@ NeuroOptic is a research-grade visual oscillator designed for precise brainwave 
 *   **Waveforms**:
     *   **Sine**: Physiological oscillatory mimicry (Default).
     *   **Square**: Strong entrainment (Binary On/Off).
+    *   **Triangle**: Linear fade in/out.
     *   **AM Carrier**: High-frequency carrier modulated at target frequency.
+*   **Stimulation Modes**:
+    *   **Full Screen**: Standard entrainment.
+    *   **Split Hemifield**: Independent Left/Right control for binocular beats or lateralized stimulation.
+    *   **Peripheral Ring**: Foveal sparing stimulation.
+    *   **Quadrants**: Retinotopic mapping support (Top-Left, Bottom-Right, etc.).
+*   **Research & Sham Control**:
+    *   **Detune**: Frequency drifts slightly to prevent entrainment.
+    *   **Low Amp**: Sub-threshold intensity.
+    *   **Jitter**: Randomized phase timing.
+    *   **Static**: Non-flickering control.
 *   **Tech Stack**: Python, GLFW, OpenGL (VSync enabled).
 
 ### Installation
@@ -27,6 +38,13 @@ NeuroOptic is a research-grade visual oscillator designed for precise brainwave 
 
 ### Usage
 
+#### Graphical Interface (Recommended)
+Launch the GUI controller:
+```bash
+python launcher.py
+```
+
+#### Command Line Interface
 Run the engine via command line:
 
 ```bash
@@ -41,4 +59,13 @@ python entrainment_engine.py --freq 40.0 --waveform square
 
 # Amplitude Modulated
 python entrainment_engine.py --freq 40.0 --waveform am
+
+# Split Hemifield (Binocular Beats: Left 10Hz, Right 11Hz)
+python entrainment_engine.py --mode split --freq 10.0 --freq-right 11.0
+
+# Research Mode (Sham: Detuned Frequency)
+python entrainment_engine.py --freq 40.0 --sham detune
+
+# Session Control (10 min session, 5s ramp-up)
+python entrainment_engine.py --duration 600 --ramp 5.0
 ```

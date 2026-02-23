@@ -9,7 +9,7 @@ and strict safety limits based on monitor refresh rates.
 import sys
 import time
 import math
-import platform
+import platform as sys_platform
 import random
 import csv
 import os
@@ -734,7 +734,7 @@ class EntrainmentEngine:
                 
                 # 12️⃣ Log More Metadata (Header Block)
                 writer.writerow(["# === Session Metadata ==="])
-                writer.writerow(["# OS", f"{platform.system()} {platform.release()}"])
+                writer.writerow(["# OS", f"{sys_platform.system()} {sys_platform.release()}"])
                 writer.writerow(["# Python", sys.version.split()[0]])
                 writer.writerow(["# GPU", self.gpu_info.get('renderer', 'Unknown')])
                 writer.writerow(["# Driver", self.gpu_info.get('version', 'Unknown')])
