@@ -323,7 +323,9 @@ class StimulusRenderer:
 
         # Setup GPU Timer Queries
         try:
-            self.query = glGenQueries(1)
+            # PyOpenGL returns a numpy array for queries; extract scalar ID
+            queries = glGenQueries(1)
+            self.query = int(queries[0]) if hasattr(queries, '__len__') else int(queries)
             self.gpu_timer_available = True
         except Exception as e:
             logger.warning(f"GPU Timer Queries not supported: {e}")
