@@ -1,3 +1,0 @@
-glfw>=2.5.0
-PyOpenGL>=3.1.0
-numpy>=1.20.0
