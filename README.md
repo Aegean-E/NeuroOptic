@@ -1,7 +1,7 @@
 # NeuroOptic
 
 <p align="center">
-  <img src="https://github.com/Aegean-E/NeuroOptic/blob/main/banner.png?raw=true" alt="NeuroOptic Banner" width="1200">
+  <img src="https://github.com/Aegean-E/NeuroOptic/blob/main/banner.jpg?raw=true" alt="NeuroOptic Banner" width="1200">
 </p>
 
 ## Generalized Visual Entrainment Engine

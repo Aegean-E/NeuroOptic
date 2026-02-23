@@ -14,6 +14,7 @@ import random
 import csv
 import os
 from datetime import datetime
+import ctypes
 import gc
 import logging
 import argparse
@@ -24,6 +25,7 @@ from typing import Optional, Tuple
 import glfw
 import numpy as np
 from OpenGL.GL import *
+from OpenGL.GL.shaders import compileProgram, compileShader
 
 # Configure Logging
 logging.basicConfig(
@@ -130,19 +132,20 @@ class FrequencyManager:
         return target_freq, waveform
 
 
-class Oscillator:
+class PhaseOscillator:
     """
-    Master Oscillator Engine.
-    Core equation: phase(t) = (2π × f × t + φ) mod 2π
+    True Frame-Locked Phase Accumulator.
+    Derives phase from frame index steps rather than CPU time.
+    
+    Model: phase[n] = (phase[n-1] + 2π * f / R) % 2π
     """
 
     def __init__(self, frequency: float, waveform: WaveformType, phase_offset: float = 0.0, rng: random.Random = None):
         self.frequency = frequency
         self.waveform = waveform
-        self.phase_base = phase_offset  # Base phase offset (radians)
-        self.t_ref = 0.0  # Reference time for frequency changes
+        self.phase = phase_offset  # Current accumulated phase
         self.carrier_freq = 0.0  # Only for AM_CARRIER
-        self.carrier_phase_base = 0.0
+        self.carrier_phase = 0.0
         self.phase_jitter = 0.0
         self.rng = rng if rng else random.Random()
 
@@ -154,64 +157,231 @@ class Oscillator:
 
     def set_frequency(self, new_freq: float, current_t: float):
         """
-        Updates frequency in real-time without phase discontinuity.
+        Updates frequency. Phase continuity is automatically preserved 
+        because we accumulate onto the existing phase state.
         """
-        dt = current_t - self.t_ref
-
-        # Snapshot current phases to become new bases
-        self.phase_base = (2 * math.pi * self.frequency * dt + self.phase_base) % (2 * math.pi)
-        self.carrier_phase_base = (2 * math.pi * self.carrier_freq * dt + self.carrier_phase_base) % (2 * math.pi)
-
         self.frequency = new_freq
-        self.t_ref = current_t
+        # current_t is ignored in frame-locked model, kept for API compatibility
 
     def update_phase(self, delta_rad: float):
         """
         Injects a phase shift (e.g., for closed-loop error correction).
         """
-        self.phase_base = (self.phase_base + delta_rad) % (2 * math.pi)
+        self.phase = (self.phase + delta_rad) % (2 * math.pi)
 
-    def get_luminance(self, t: float) -> float:
+    def step(self, refresh_rate: float):
         """
-        Calculates luminance (0.0 to 1.0) at monotonic time t.
+        Advances the oscillator by one frame step.
         """
-        # Time relative to last frequency change
-        dt = t - self.t_ref
+        # Deterministic phase step
+        increment = (2 * math.pi * self.frequency) / refresh_rate
+        self.phase = (self.phase + increment) % (2 * math.pi)
 
-        # Core Phase Calculation
+        if self.waveform == WaveformType.AM_CARRIER:
+            c_inc = (2 * math.pi * self.carrier_freq) / refresh_rate
+            self.carrier_phase = (self.carrier_phase + c_inc) % (2 * math.pi)
+
+    def get_phase_state(self) -> Tuple[float, float]:
+        """
+        Returns (modulator_phase, carrier_phase) with jitter applied.
+        """
         jitter = 0.0
         if self.phase_jitter > 0:
             jitter = self.rng.uniform(-self.phase_jitter, self.phase_jitter)
+        
+        return (self.phase + jitter) % (2 * math.pi), self.carrier_phase
 
-        # phase = 2π * f * dt + φ_base
-        phase = (2 * math.pi * self.frequency * dt + self.phase_base + jitter) % (2 * math.pi)
 
-        if self.waveform == WaveformType.SQUARE:
-            # Binary on/off flicker
-            # sin(phase) >= 0 is ON (1.0), else OFF (0.0)
-            return 1.0 if math.sin(phase) >= 0 else 0.0
+class StimulusRenderer:
+    """
+    Modern OpenGL (GLSL) Renderer.
+    Handles high-precision luminance calculation and photometric calibration on GPU.
+    """
+    
+    VERTEX_SRC = """
+    #version 330 core
+    layout (location = 0) in vec2 aPos;
+    layout (location = 1) in vec2 aTexCoord;
+    out vec2 TexCoords;
+    void main() {
+        gl_Position = vec4(aPos, 0.0, 1.0);
+        TexCoords = aTexCoord;
+    }
+    """
 
-        elif self.waveform == WaveformType.SINE:
-            # Smooth oscillation
-            # Map [-1, 1] sine wave to [0, 1] luminance
-            return 0.5 + 0.5 * math.sin(phase)
+    FRAGMENT_SRC = """
+    #version 330 core
+    out vec4 FragColor;
+    in vec2 TexCoords;
 
-        elif self.waveform == WaveformType.AM_CARRIER:
-            # Amplitude Modulated Carrier
-            # Carrier signal (high freq) modulated by target frequency
-            carrier_phase = (2 * math.pi * self.carrier_freq * dt + self.carrier_phase_base) % (2 * math.pi)
-            carrier_val = 0.5 + 0.5 * math.sin(carrier_phase)
+    uniform float u_phase_left;
+    uniform float u_phase_right;
+    uniform float u_c_phase_left; // Carrier
+    uniform float u_c_phase_right;
 
-            modulator_val = 0.5 + 0.5 * math.sin(phase)
-            return carrier_val * modulator_val
+    uniform int u_wf_left; // 1:SQUARE, 2:SINE, 3:AM, 4:TRIANGLE
+    uniform int u_wf_right;
 
-        elif self.waveform == WaveformType.TRIANGLE:
-            # Triangle Wave (Future-Expandable)
-            # Map phase [0, 2pi] to [0, 1] luminance linearly
-            p = phase / (2 * math.pi)
-            return 1.0 - abs(2.0 * p - 1.0)
+    uniform float u_amp_left;
+    uniform float u_amp_right;
+    uniform int u_mode; // 1:FULL, 2:RING, 3:LEFT, 4:RIGHT, 5:SPLIT, 6-9:QUADS
 
-        return 0.0
+    uniform sampler1D u_lut;
+    uniform int u_use_lut;
+    uniform float u_gamma;
+
+    const float PI = 3.14159265359;
+
+    float get_signal(int wf, float ph, float c_ph) {
+        if (wf == 1) return sin(ph) >= 0.0 ? 1.0 : 0.0; // SQUARE
+        if (wf == 2) return 0.5 + 0.5 * sin(ph);        // SINE
+        if (wf == 3) {                                  // AM
+            float car = 0.5 + 0.5 * sin(c_ph);
+            float mod = 0.5 + 0.5 * sin(ph);
+            return car * mod;
+        }
+        if (wf == 4) {                                  // TRIANGLE
+            float p = mod(ph, 2.0 * PI) / (2.0 * PI);
+            return 1.0 - abs(2.0 * p - 1.0);
+        }
+        return 0.0;
+    }
+
+    void main() {
+        vec2 uv = TexCoords;
+        bool use_left = false;
+        bool use_right = false;
+
+        // Spatial Mode Logic
+        if (u_mode == 1) { use_left = true; } // FULL
+        else if (u_mode == 2) { // RING
+            if (distance(uv, vec2(0.5)) > 0.15) use_left = true; // 0.3 NDC radius
+        }
+        else if (u_mode == 3) { if (uv.x < 0.5) use_left = true; } // LEFT
+        else if (u_mode == 4) { if (uv.x >= 0.5) use_left = true; } // RIGHT (Uses Left Osc settings)
+        else if (u_mode == 5) { // SPLIT
+            if (uv.x < 0.5) use_left = true; else use_right = true;
+        }
+        else if (u_mode == 6) { if (uv.x < 0.5 && uv.y > 0.5) use_left = true; } // TL
+        else if (u_mode == 7) { if (uv.x >= 0.5 && uv.y > 0.5) use_left = true; } // TR
+        else if (u_mode == 8) { if (uv.x < 0.5 && uv.y <= 0.5) use_left = true; } // BL
+        else if (u_mode == 9) { if (uv.x >= 0.5 && uv.y <= 0.5) use_left = true; } // BR
+
+        float raw = 0.0;
+        if (use_left) raw = get_signal(u_wf_left, u_phase_left, u_c_phase_left) * u_amp_left;
+        else if (use_right) raw = get_signal(u_wf_right, u_phase_right, u_c_phase_right) * u_amp_right;
+
+        // Photometric Calibration
+        float final = raw;
+        if (u_use_lut == 1) {
+            final = texture(u_lut, raw).r;
+        } else if (u_gamma != 1.0 && raw > 0.0) {
+            final = pow(raw, 1.0 / u_gamma);
+        }
+
+        FragColor = vec4(final, final, final, 1.0);
+    }
+    """
+
+    def __init__(self):
+        self.shader = None
+        self.vao = None
+        self.lut_tex = None
+        self.lut_active = False
+
+    def init_gl(self):
+        # Compile Shader
+        self.shader = compileProgram(
+            compileShader(self.VERTEX_SRC, GL_VERTEX_SHADER),
+            compileShader(self.FRAGMENT_SRC, GL_FRAGMENT_SHADER)
+        )
+
+        # Setup Fullscreen Quad
+        vertices = np.array([
+            # Pos        # Tex
+            -1.0, -1.0,  0.0, 0.0,
+             1.0, -1.0,  1.0, 0.0,
+            -1.0,  1.0,  0.0, 1.0,
+             1.0,  1.0,  1.0, 1.0
+        ], dtype=np.float32)
+
+        self.vao = glGenVertexArrays(1)
+        vbo = glGenBuffers(1)
+        
+        glBindVertexArray(self.vao)
+        glBindBuffer(GL_ARRAY_BUFFER, vbo)
+        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
+
+        # Pos
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(0))
+        # Tex
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(2 * 4))
+
+    def load_calibration(self, filepath: str):
+        """Loads a CSV (Input, Output) and creates a 1D Texture LUT."""
+        try:
+            data = []
+            with open(filepath, 'r') as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    try:
+                        data.append(float(row[1])) # Assuming Col 0=Input, Col 1=Output
+                    except: continue
+            
+            if not data: return
+            
+            # Create Texture
+            lut_data = np.array(data, dtype=np.float32)
+            self.lut_tex = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_1D, self.lut_tex)
+            glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexImage1D(GL_TEXTURE_1D, 0, GL_R32F, len(lut_data), 0, GL_RED, GL_FLOAT, lut_data)
+            self.lut_active = True
+            logger.info(f"Photometric Calibration Loaded: {len(lut_data)} points.")
+        except Exception as e:
+            logger.error(f"Failed to load calibration: {e}")
+
+    def render(self, phase_l, c_phase_l, phase_r, c_phase_r, 
+               wf_l, wf_r, amp_l, amp_r, mode, gamma):
+        glUseProgram(self.shader)
+        
+        glUniform1f(glGetUniformLocation(self.shader, "u_phase_left"), phase_l)
+        glUniform1f(glGetUniformLocation(self.shader, "u_phase_right"), phase_r)
+        glUniform1f(glGetUniformLocation(self.shader, "u_c_phase_left"), c_phase_l)
+        glUniform1f(glGetUniformLocation(self.shader, "u_c_phase_right"), c_phase_r)
+        
+        # Map Enums to Ints (1-based for shader)
+        glUniform1i(glGetUniformLocation(self.shader, "u_wf_left"), wf_l.value)
+        glUniform1i(glGetUniformLocation(self.shader, "u_wf_right"), wf_r.value)
+        
+        glUniform1f(glGetUniformLocation(self.shader, "u_amp_left"), amp_l)
+        glUniform1f(glGetUniformLocation(self.shader, "u_amp_right"), amp_r)
+        
+        # Map Mode Enum to Int
+        # FULL=1, RING=2, LEFT=3, RIGHT=4, SPLIT=5, Q_TL=6...
+        mode_map = {
+            StimulationMode.FULL_SCREEN: 1, StimulationMode.PERIPHERAL_RING: 2,
+            StimulationMode.HEMIFIELD_LEFT: 3, StimulationMode.HEMIFIELD_RIGHT: 4,
+            StimulationMode.SPLIT_HEMIFIELD: 5,
+            StimulationMode.QUADRANT_TL: 6, StimulationMode.QUADRANT_TR: 7,
+            StimulationMode.QUADRANT_BL: 8, StimulationMode.QUADRANT_BR: 9
+        }
+        glUniform1i(glGetUniformLocation(self.shader, "u_mode"), mode_map.get(mode, 1))
+        
+        glUniform1f(glGetUniformLocation(self.shader, "u_gamma"), gamma)
+        glUniform1i(glGetUniformLocation(self.shader, "u_use_lut"), 1 if self.lut_active else 0)
+        
+        if self.lut_active:
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_1D, self.lut_tex)
+            glUniform1i(glGetUniformLocation(self.shader, "u_lut"), 0)
+
+        glBindVertexArray(self.vao)
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
 
 
 class EntrainmentEngine:
@@ -228,7 +398,8 @@ class EntrainmentEngine:
             brightness: float = 1.0,
             phase_offset: float = 0.0,
             right_freq: Optional[float] = None,
-            right_phase_offset: float = 0.0
+            right_phase_offset: float = 0.0,
+            calibration_file: Optional[str] = None
     ):
         self.target_freq = target_freq
         self.waveform = waveform
@@ -240,6 +411,7 @@ class EntrainmentEngine:
         self.gamma = gamma
         self.max_brightness = brightness
         self.phase_offset_rad = math.radians(phase_offset)
+        self.calibration_file = calibration_file
         
         # Dual Hemifield Logic
         self.right_freq = right_freq if right_freq is not None else target_freq
@@ -268,10 +440,11 @@ class EntrainmentEngine:
 
         self.window = None
         self.monitor_refresh_rate = 60  # Default fallback
-        self.oscillator_left: Optional[Oscillator] = None
-        self.oscillator_right: Optional[Oscillator] = None
+        self.oscillator_left: Optional[PhaseOscillator] = None
+        self.oscillator_right: Optional[PhaseOscillator] = None
         self.gpu_info = {}
         self.running = False
+        self.renderer = StimulusRenderer()
 
         self.phase_jitter_amount = 0.0
         if self.sham_type == ShamType.PHASE_JITTER:
@@ -307,8 +480,8 @@ class EntrainmentEngine:
                                                                                   self.waveform)
 
             # Create Oscillator AFTER validation to ensure settings (like jitter) aren't overwritten
-            self.oscillator_left = Oscillator(self.target_freq, self.waveform_left, phase_offset=self.phase_offset_rad, rng=self.rng)
-            self.oscillator_right = Oscillator(self.right_freq, self.waveform_right, phase_offset=self.right_phase_rad, rng=self.rng)
+            self.oscillator_left = PhaseOscillator(self.target_freq, self.waveform_left, phase_offset=self.phase_offset_rad, rng=self.rng)
+            self.oscillator_right = PhaseOscillator(self.right_freq, self.waveform_right, phase_offset=self.right_phase_rad, rng=self.rng)
 
             # Apply Sham / Advanced Settings
             if self.phase_jitter_amount > 0:
@@ -351,6 +524,11 @@ class EntrainmentEngine:
 
         # OpenGL Setup
         glClearColor(0.0, 0.0, 0.0, 1.0)
+        
+        # Initialize Renderer & Calibration
+        self.renderer.init_gl()
+        if self.calibration_file:
+            self.renderer.load_calibration(self.calibration_file)
 
         # 3️⃣ Hardware Abstraction Layer - Metadata Collection
         # We query OpenGL after context is current
@@ -371,17 +549,6 @@ class EntrainmentEngine:
         logger.info(f"VSync: Enabled (Double Buffered)")
         logger.info("==================================")
 
-    def _draw_circle(self, radius: float, segments: int = 100):
-        """Helper to draw a circle (used for Ring mask)."""
-        glBegin(GL_TRIANGLE_FAN)
-        glVertex2f(0.0, 0.0)  # Center
-        for i in range(segments + 1):
-            theta = 2.0 * math.pi * float(i) / float(segments)
-            x = radius * math.cos(theta)
-            y = radius * math.sin(theta)
-            glVertex2f(x, y)
-        glEnd()
-
     def set_frequency(self, freq: float):
         # Updates main (left) oscillator
         if self.oscillator_left:
@@ -390,56 +557,6 @@ class EntrainmentEngine:
     def update_phase(self, delta_deg: float):
         if self.oscillator_left:
             self.oscillator_left.update_phase(math.radians(delta_deg))
-
-    def render_stimulus(self, lum_left: float, lum_right: float):
-        """Renders the visual stimulus based on the selected mode."""
-        
-        if self.mode == StimulationMode.FULL_SCREEN:
-            glColor3f(lum_left, lum_left, lum_left)
-            glRectf(-1.0, -1.0, 1.0, 1.0)
-
-        elif self.mode == StimulationMode.SPLIT_HEMIFIELD:
-            # 10️⃣ Independent Dual-Hemifield
-            # Left Side
-            glColor3f(lum_left, lum_left, lum_left)
-            glRectf(-1.0, -1.0, 0.0, 1.0)
-            # Right Side
-            glColor3f(lum_right, lum_right, lum_right)
-            glRectf(0.0, -1.0, 1.0, 1.0)
-
-        elif self.mode == StimulationMode.PERIPHERAL_RING:
-            glColor3f(lum_left, lum_left, lum_left)
-            # 1. Draw full oscillating background
-            glRectf(-1.0, -1.0, 1.0, 1.0)
-            # 2. Draw static black central mask (Radius 0.3 NDC)
-            glColor3f(0.0, 0.0, 0.0)
-            self._draw_circle(0.3)
-
-        elif self.mode == StimulationMode.HEMIFIELD_LEFT:
-            glColor3f(lum_left, lum_left, lum_left)
-            glRectf(-1.0, -1.0, 0.0, 1.0)  # Left half
-
-        elif self.mode == StimulationMode.HEMIFIELD_RIGHT:
-            # Use lum_left (main) unless we want to force right oscillator? 
-            # Standard behavior is main freq on selected field.
-            glColor3f(lum_left, lum_left, lum_left)
-            glRectf(0.0, -1.0, 1.0, 1.0)  # Right half
-
-        elif self.mode == StimulationMode.QUADRANT_TL:
-            glColor3f(lum_left, lum_left, lum_left)
-            glRectf(-1.0, 0.0, 0.0, 1.0)  # Top-Left
-
-        elif self.mode == StimulationMode.QUADRANT_TR:
-            glColor3f(lum_left, lum_left, lum_left)
-            glRectf(0.0, 0.0, 1.0, 1.0)  # Top-Right
-
-        elif self.mode == StimulationMode.QUADRANT_BL:
-            glColor3f(lum_left, lum_left, lum_left)
-            glRectf(-1.0, -1.0, 0.0, 0.0)  # Bottom-Left
-
-        elif self.mode == StimulationMode.QUADRANT_BR:
-            glColor3f(lum_left, lum_left, lum_left)
-            glRectf(0.0, -1.0, 1.0, 0.0)  # Bottom-Right
 
     def run(self):
         """
@@ -489,38 +606,36 @@ class EntrainmentEngine:
             if self.sham_type == ShamType.LOW_AMP:
                 amplitude_scalar *= 0.15  # Cap at 15% brightness
 
-            # 4. Oscillator Update & Luminance Calculation
-            # We pass the SESSION time (elapsed_time) to the oscillator.
-            # This ensures Phase 0 always aligns with Session Start (t=0), regardless of startup delay.
-            raw_lum_left = self.oscillator_left.get_luminance(elapsed_time)
-            raw_lum_right = self.oscillator_right.get_luminance(elapsed_time)
-
-            # Apply amplitude envelope (Ramp/Sham)
-            lum_left = raw_lum_left * amplitude_scalar
-            lum_right = raw_lum_right * amplitude_scalar
-
-            # 6️⃣ Brightness Ceiling (Scaling)
-            lum_left *= self.max_brightness
-            lum_right *= self.max_brightness
-
-            # 5️⃣ Gamma Correction (Inverse)
-            # L_out = L_in ^ gamma  =>  L_in = L_out ^ (1/gamma)
-            if self.gamma != 1.0:
-                if lum_left > 0: lum_left = lum_left ** (1.0 / self.gamma)
-                if lum_right > 0: lum_right = lum_right ** (1.0 / self.gamma)
+            # 4. Frame-Locked Phase Update
+            self.oscillator_left.step(self.monitor_refresh_rate)
+            self.oscillator_right.step(self.monitor_refresh_rate)
+            
+            # Get current phase states (with jitter)
+            ph_l, c_ph_l = self.oscillator_left.get_phase_state()
+            ph_r, c_ph_r = self.oscillator_right.get_phase_state()
+            
+            # Calculate Amplitudes (Ramp * Global Cap)
+            amp_l = amplitude_scalar * self.max_brightness
+            amp_r = amplitude_scalar * self.max_brightness
 
             # Record Metric (Skip first frame initialization delta)
-            # OPTIMIZATION: Append once with calculated luminance to avoid double tuple allocation
-            # We log Left luminance as primary reference
+            # For logging, we approximate the luminance of the Left channel
+            # Note: This is pre-gamma/calibration, representing the "Signal"
             if frame_count > 0:
-                self.frame_data.append((current_time, delta_time, lum_left))
+                # Simple sine approximation for log if needed, or just 0.0
+                # Calculating exact luminance here duplicates shader work. 
+                # We log the signal amplitude for now.
+                self.frame_data.append((current_time, delta_time, amp_l))
 
             # 4. Render
-            # Clear background to black
             glClearColor(0.0, 0.0, 0.0, 1.0)
             glClear(GL_COLOR_BUFFER_BIT)
             
-            self.render_stimulus(lum_left, lum_right)
+            self.renderer.render(
+                ph_l, c_ph_l, ph_r, c_ph_r,
+                self.waveform_left, self.waveform_right,
+                amp_l, amp_r, self.mode, self.gamma
+            )
 
             # 5. VSync Swap
             glfw.swap_buffers(self.window)
@@ -638,6 +753,7 @@ class EntrainmentEngine:
                 writer.writerow(["# Gamma", self.gamma])
                 writer.writerow(["# Brightness Cap", self.max_brightness])
                 writer.writerow(["# Sham Type", self.sham_type.name])
+                writer.writerow(["# Calibration File", self.calibration_file if self.calibration_file else "None"])
                 writer.writerow(["# Sham Seed", self.sham_seed])
                 writer.writerow(["# ========================"])
                 
@@ -749,6 +865,12 @@ def parse_arguments():
         help='Phase offset for Right Hemifield in degrees (0-360).'
     )
 
+    parser.add_argument(
+        '--calib-file',
+        type=str,
+        help='Path to photometric calibration CSV (Input, Output).'
+    )
+
     return parser.parse_args()
 
 
@@ -810,7 +932,8 @@ if __name__ == "__main__":
         brightness=args.brightness,
         phase_offset=args.phase,
         right_freq=args.freq_right,
-        right_phase_offset=args.phase_right
+        right_phase_offset=args.phase_right,
+        calibration_file=args.calib_file
     )
 
     engine.initialize_hardware()

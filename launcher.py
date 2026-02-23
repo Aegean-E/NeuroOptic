@@ -1,121 +1,117 @@
+import customtkinter as ctk
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
 import subprocess
 import sys
 import os
 
+# Set Theme
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
 
 class NeuroOpticLauncher:
     def __init__(self, root):
         self.root = root
         self.root.title("NeuroOptic Controller")
-        self.root.geometry("450x600")
-        self.root.resizable(False, False)
-
-        # Styles
-        style = ttk.Style()
-        style.configure("TLabel", font=("Segoe UI", 10))
-        style.configure("TButton", font=("Segoe UI", 10, "bold"))
+        self.root.geometry("500x720")
+        # self.root.resizable(False, False)
 
         # --- Header ---
-        header = ttk.Label(root, text="Visual Entrainment Engine", font=("Segoe UI", 14, "bold"))
-        header.pack(pady=15)
+        header = ctk.CTkLabel(root, text="Visual Entrainment Engine", font=("Segoe UI", 22, "bold"))
+        header.pack(pady=(20, 10))
 
         # --- Main Container ---
-        main_frame = ttk.Frame(root, padding="20")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame = ctk.CTkFrame(root, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=20, pady=10)
 
         # --- Frequency Section ---
-        freq_frame = ttk.LabelFrame(main_frame, text="Frequency Configuration", padding="10")
-        freq_frame.pack(fill=tk.X, pady=5)
+        freq_frame = self.create_group_frame(main_frame, "Frequency Configuration")
 
-        ttk.Label(freq_frame, text="Preset Band:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.preset_var = tk.StringVar(value="Custom")
-        self.preset_combo = ttk.Combobox(freq_frame, textvariable=self.preset_var, state="readonly")
-        self.preset_combo['values'] = ('Custom', 'Delta (2Hz)', 'Alpha (10Hz)', 'Beta (20Hz)', 'Gamma (40Hz)',
-                                       'High Gamma (80Hz)')
-        self.preset_combo.grid(row=0, column=1, sticky=tk.E, padx=5)
-        self.preset_combo.bind("<<ComboboxSelected>>", self.on_preset_change)
+        ctk.CTkLabel(freq_frame, text="Preset Band:").grid(row=1, column=0, sticky="w", pady=10, padx=10)
+        self.preset_var = ctk.StringVar(value="Custom")
+        self.preset_combo = ctk.CTkComboBox(freq_frame, variable=self.preset_var, state="readonly",
+                                            values=['Custom', 'Delta (2Hz)', 'Alpha (10Hz)', 'Beta (20Hz)', 'Gamma (40Hz)', 'High Gamma (80Hz)'],
+                                            command=self.on_preset_change)
+        self.preset_combo.grid(row=1, column=1, sticky="e", padx=10)
 
-        ttk.Label(freq_frame, text="Target Frequency (Hz):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ctk.CTkLabel(freq_frame, text="Target Frequency (Hz):").grid(row=2, column=0, sticky="w", pady=10, padx=10)
         self.freq_var = tk.DoubleVar(value=40.0)
-        self.freq_entry = ttk.Entry(freq_frame, textvariable=self.freq_var)
-        self.freq_entry.grid(row=1, column=1, sticky=tk.E, padx=5)
+        self.freq_entry = ctk.CTkEntry(freq_frame, textvariable=self.freq_var)
+        self.freq_entry.grid(row=2, column=1, sticky="e", padx=10)
 
-        ttk.Label(freq_frame, text="Waveform:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.waveform_var = tk.StringVar(value="sine")
-        self.waveform_combo = ttk.Combobox(freq_frame, textvariable=self.waveform_var, state="readonly")
-        self.waveform_combo['values'] = ('sine', 'square', 'am', 'triangle')
-        self.waveform_combo.grid(row=2, column=1, sticky=tk.E, padx=5)
+        ctk.CTkLabel(freq_frame, text="Waveform:").grid(row=3, column=0, sticky="w", pady=10, padx=10)
+        self.waveform_var = ctk.StringVar(value="sine")
+        self.waveform_combo = ctk.CTkComboBox(freq_frame, variable=self.waveform_var, state="readonly",
+                                              values=['sine', 'square', 'am', 'triangle'])
+        self.waveform_combo.grid(row=3, column=1, sticky="e", padx=10)
 
         # --- Visual Mode Section ---
-        vis_frame = ttk.LabelFrame(main_frame, text="Visual Stimulation Mode", padding="10")
-        vis_frame.pack(fill=tk.X, pady=10)
+        vis_frame = self.create_group_frame(main_frame, "Visual Stimulation Mode")
 
-        ttk.Label(vis_frame, text="Mode:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.mode_var = tk.StringVar(value="full")
-        self.mode_combo = ttk.Combobox(vis_frame, textvariable=self.mode_var, state="readonly")
-        self.mode_combo['values'] = (
-            'full', 'ring',
-            'left', 'right', 'split',
-            'quad_tl', 'quad_tr', 'quad_bl', 'quad_br'
-        )
-        self.mode_combo.grid(row=0, column=1, sticky=tk.E, padx=5)
+        ctk.CTkLabel(vis_frame, text="Mode:").grid(row=1, column=0, sticky="w", pady=10, padx=10)
+        self.mode_var = ctk.StringVar(value="full")
+        self.mode_combo = ctk.CTkComboBox(vis_frame, variable=self.mode_var, state="readonly",
+                                          values=['full', 'ring', 'left', 'right', 'split', 'quad_tl', 'quad_tr', 'quad_bl', 'quad_br'])
+        self.mode_combo.grid(row=1, column=1, sticky="e", padx=10)
 
         # --- Session Control ---
-        session_frame = ttk.LabelFrame(main_frame, text="Session Control", padding="10")
-        session_frame.pack(fill=tk.X, pady=5)
+        session_frame = self.create_group_frame(main_frame, "Session Control")
 
-        ttk.Label(session_frame, text="Duration (sec, 0=Inf):").grid(row=0, column=0, sticky=tk.W, pady=5)
+        ctk.CTkLabel(session_frame, text="Duration (sec, 0=Inf):").grid(row=1, column=0, sticky="w", pady=10, padx=10)
         self.duration_var = tk.DoubleVar(value=0.0)
-        ttk.Entry(session_frame, textvariable=self.duration_var).grid(row=0, column=1, sticky=tk.E, padx=5)
+        ctk.CTkEntry(session_frame, textvariable=self.duration_var).grid(row=1, column=1, sticky="e", padx=10)
 
-        ttk.Label(session_frame, text="Ramp Up (sec):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ctk.CTkLabel(session_frame, text="Ramp Up (sec):").grid(row=2, column=0, sticky="w", pady=10, padx=10)
         self.ramp_var = tk.DoubleVar(value=0.0)
-        ttk.Entry(session_frame, textvariable=self.ramp_var).grid(row=1, column=1, sticky=tk.E, padx=5)
+        ctk.CTkEntry(session_frame, textvariable=self.ramp_var).grid(row=2, column=1, sticky="e", padx=10)
 
         # --- Research / Sham ---
-        sham_frame = ttk.LabelFrame(main_frame, text="Research / Sham Control", padding="10")
-        sham_frame.pack(fill=tk.X, pady=10)
+        sham_frame = self.create_group_frame(main_frame, "Research / Sham Control")
 
-        ttk.Label(sham_frame, text="Sham Condition:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.sham_var = tk.StringVar(value="none")
-        self.sham_combo = ttk.Combobox(sham_frame, textvariable=self.sham_var, state="readonly")
-        self.sham_combo['values'] = ('none', 'detune', 'low_amp', 'jitter', 'static')
-        self.sham_combo.grid(row=0, column=1, sticky=tk.E, padx=5)
+        ctk.CTkLabel(sham_frame, text="Sham Condition:").grid(row=1, column=0, sticky="w", pady=10, padx=10)
+        self.sham_var = ctk.StringVar(value="none")
+        self.sham_combo = ctk.CTkComboBox(sham_frame, variable=self.sham_var, state="readonly",
+                                          values=['none', 'detune', 'low_amp', 'jitter', 'static'])
+        self.sham_combo.grid(row=1, column=1, sticky="e", padx=10)
 
         # --- Display & Phase ---
-        display_frame = ttk.LabelFrame(main_frame, text="Display & Phase", padding="10")
-        display_frame.pack(fill=tk.X, pady=5)
+        display_frame = self.create_group_frame(main_frame, "Display & Phase")
 
-        ttk.Label(display_frame, text="Gamma (e.g. 2.2):").grid(row=0, column=0, sticky=tk.W, pady=5)
+        ctk.CTkLabel(display_frame, text="Gamma:").grid(row=1, column=0, sticky="w", pady=10, padx=5)
         self.gamma_var = tk.DoubleVar(value=1.0)
-        ttk.Entry(display_frame, textvariable=self.gamma_var, width=10).grid(row=0, column=1, sticky=tk.E, padx=5)
+        ctk.CTkEntry(display_frame, textvariable=self.gamma_var, width=80).grid(row=1, column=1, sticky="w", padx=5)
 
-        ttk.Label(display_frame, text="Brightness (0-1):").grid(row=0, column=2, sticky=tk.W, pady=5, padx=(10, 0))
+        ctk.CTkLabel(display_frame, text="Bright:").grid(row=1, column=2, sticky="w", pady=10, padx=5)
         self.brightness_var = tk.DoubleVar(value=1.0)
-        ttk.Entry(display_frame, textvariable=self.brightness_var, width=10).grid(row=0, column=3, sticky=tk.E, padx=5)
+        ctk.CTkEntry(display_frame, textvariable=self.brightness_var, width=80).grid(row=1, column=3, sticky="w", padx=5)
 
-        ttk.Label(display_frame, text="Phase Offset (°):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ctk.CTkLabel(display_frame, text="Phase (°):").grid(row=2, column=0, sticky="w", pady=10, padx=5)
         self.phase_var = tk.DoubleVar(value=0.0)
-        ttk.Entry(display_frame, textvariable=self.phase_var, width=10).grid(row=1, column=1, sticky=tk.E, padx=5)
+        ctk.CTkEntry(display_frame, textvariable=self.phase_var, width=80).grid(row=2, column=1, sticky="w", padx=5)
 
-        ttk.Label(display_frame, text="Right Freq (Split):").grid(row=1, column=2, sticky=tk.W, pady=5, padx=(10, 0))
+        ctk.CTkLabel(display_frame, text="R-Freq:").grid(row=2, column=2, sticky="w", pady=10, padx=5)
         self.right_freq_var = tk.DoubleVar(value=0.0)
-        ttk.Entry(display_frame, textvariable=self.right_freq_var, width=10).grid(row=1, column=3, sticky=tk.E, padx=5)
+        ctk.CTkEntry(display_frame, textvariable=self.right_freq_var, width=80).grid(row=2, column=3, sticky="w", padx=5)
 
-        ttk.Label(display_frame, text="Right Phase (°):").grid(row=2, column=2, sticky=tk.W, pady=5, padx=(10, 0))
+        ctk.CTkLabel(display_frame, text="R-Phase:").grid(row=3, column=2, sticky="w", pady=10, padx=5)
         self.right_phase_var = tk.DoubleVar(value=0.0)
-        ttk.Entry(display_frame, textvariable=self.right_phase_var, width=10).grid(row=2, column=3, sticky=tk.E, padx=5)
+        ctk.CTkEntry(display_frame, textvariable=self.right_phase_var, width=80).grid(row=3, column=3, sticky="w", padx=5)
 
         # --- Launch Button ---
-        self.launch_btn = ttk.Button(main_frame, text="LAUNCH ENGINE", command=self.launch_engine)
-        self.launch_btn.pack(fill=tk.X, pady=20, ipady=10)
+        self.launch_btn = ctk.CTkButton(main_frame, text="LAUNCH ENGINE", command=self.launch_engine, font=("Segoe UI", 12, "bold"), height=40)
+        self.launch_btn.pack(fill="x", pady=20)
 
-        ttk.Label(main_frame, text="Press ESC in the engine window to exit.", font=("Segoe UI", 8, "italic")).pack()
+        ctk.CTkLabel(main_frame, text="Press ESC in the engine window to exit.", font=("Segoe UI", 10, "italic")).pack()
 
-    def on_preset_change(self, event):
-        selection = self.preset_var.get()
+    def create_group_frame(self, parent, title):
+        frame = ctk.CTkFrame(parent)
+        frame.pack(fill="x", pady=5)
+        title_lbl = ctk.CTkLabel(frame, text=title, font=("Segoe UI", 13, "bold"))
+        title_lbl.grid(row=0, column=0, columnspan=4, sticky="w", padx=10, pady=(5, 0))
+        return frame
+
+    def on_preset_change(self, choice):
+        selection = choice
         if "Delta" in selection:
             self.freq_var.set(2.0)
         elif "Alpha" in selection:
@@ -163,6 +159,6 @@ class NeuroOpticLauncher:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = ctk.CTk()
     app = NeuroOpticLauncher(root)
     root.mainloop()
